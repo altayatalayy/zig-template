@@ -1,0 +1,13 @@
+services:
+{% for svc in services %}
+  - name: {{ svc.name }}
+    image: {{ svc.image }}
+{% if svc.ports %}
+    ports:
+{% for p in svc.ports %}
+      - {{ p }}
+{% endfor %}
+{% else %}
+    ports: []
+{% endif %}
+{% endfor %}
