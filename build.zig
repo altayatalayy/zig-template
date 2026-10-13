@@ -25,7 +25,8 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(example);
     const run_example = b.addRunArtifact(example);
-    run_example.addFileArg(b.path("examples/codegen.tmpl"));
-    run_example.addArg(b.getInstallPath(.prefix, "codegen.yaml"));
-    b.step("example", "Run the codegen example").dependOn(&run_example.step);
+    run_example.addFileArg2(b.path("examples/codegen.tmpl"), .{});
+    const generated = run_example.addOutputFileArg2("codegen.yaml", .{});
+    const install_generated = b.addInstallFile(generated, "codegen.yaml");
+    b.step("example", "Run the codegen example").dependOn(&install_generated.step);
 }

@@ -1,6 +1,6 @@
 # zig-template
 
-A small Jinja-subset template engine for Zig 0.16, aimed at code generation.
+A small Jinja-subset template engine for Zig 0.17, aimed at code generation.
 It renders a runtime `Value` tree (the shape a YAML/JSON loader produces), so
 the same engine can emit Zig, C/C++, Rust, Go, Python, JS/TS — any text.
 
