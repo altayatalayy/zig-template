@@ -3,23 +3,34 @@
 //! It is allocated in a `Template`'s arena and borrows the source text, so the
 //! `[]const u8` fields point into the original template string.
 
-pub const Method = enum { upper, lower };
+pub const Method = union(enum) {
+    upper,
+    lower,
+    /// Indents every line after the first by this many spaces.
+    indent: usize,
+};
+
 pub const CmpOp = enum { eq, ne };
 
 /// A dotted name (`a.b.c`), optionally ending in a method call (`name.upper()`).
-pub const Path = struct { segments: []const []const u8, method: ?Method = null };
+/// `offset` is the position of the name in the source.
+pub const Path = struct {
+    segments: []const []const u8,
+    method: ?Method = null,
+    offset: usize,
+};
 
 pub const Operand = union(enum) {
     string: []const u8,
     path: Path,
 };
 
-pub const Condition = struct {
-    negate: bool,
-    kind: union(enum) {
-        truthy: Operand,
-        compare: struct { lhs: Operand, op: CmpOp, rhs: Operand },
-    },
+pub const Condition = union(enum) {
+    truthy: Operand,
+    compare: struct { lhs: Operand, op: CmpOp, rhs: Operand },
+    not: *const Condition,
+    both: [2]*const Condition,
+    either: [2]*const Condition,
 };
 
 pub const Node = union(enum) {

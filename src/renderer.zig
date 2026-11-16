@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const indent = @import("indent.zig").indent;
+const Report = @import("diagnostic.zig").Report;
 const Value = @import("value.zig").Value;
 
 pub const RenderError = error{
@@ -16,10 +18,17 @@ pub const RenderError = error{
     WriteFailed,
 };
 
-pub fn render(nodes: []const ast.Node, w: *std.Io.Writer, ctx: Value) RenderError!void {
-    if (ctx != .map) return error.ContextNotMap;
+pub fn render(
+    nodes: []const ast.Node,
+    w: *std.Io.Writer,
+    ctx: Value,
+    report: Report,
+) RenderError!void {
+    if (ctx != .map) return report.fail(0, "", error.ContextNotMap);
+
+    const renderer: Renderer = .{ .w = w, .report = report };
     const root: Scope = .{ .vars = ctx.map, .parent = null };
-    try renderNodes(nodes, w, &root);
+    try renderer.renderNodes(nodes, &root);
 }
 
 const Scope = struct {
@@ -33,97 +42,124 @@ const Scope = struct {
     }
 };
 
-fn renderNodes(nodes: []const ast.Node, w: *std.Io.Writer, scope: *const Scope) RenderError!void {
-    for (nodes) |node| switch (node) {
-        .text => |text| try w.writeAll(text),
-        .output => |operand| try renderOutput(w, scope, operand),
-        .branch => |branch| try renderBranch(w, scope, branch),
-        .loop => |loop| try renderLoop(w, scope, loop),
-    };
-}
+const Renderer = struct {
+    w: *std.Io.Writer,
+    report: Report,
 
-fn renderOutput(w: *std.Io.Writer, scope: *const Scope, operand: ast.Operand) RenderError!void {
-    switch (operand) {
-        .string => |literal| try w.writeAll(literal),
-        .path => |path| {
-            const value = try resolvePath(scope, path);
-            const method = path.method orelse return writeValue(w, value);
-            if (value != .string) return error.MethodOnNonString;
-            for (value.string) |c| try w.writeByte(switch (method) {
-                .upper => std.ascii.toUpper(c),
-                .lower => std.ascii.toLower(c),
-            });
-        },
-    }
-}
-
-fn renderBranch(w: *std.Io.Writer, scope: *const Scope, branch: ast.Node.Branch) RenderError!void {
-    for (branch.arms) |arm| {
-        if (try evalCondition(scope, arm.cond)) return renderNodes(arm.body, w, scope);
-    }
-    try renderNodes(branch.otherwise, w, scope);
-}
-
-fn renderLoop(w: *std.Io.Writer, scope: *const Scope, loop: ast.Node.Loop) RenderError!void {
-    const value = try resolvePath(scope, loop.iterable);
-    if (value != .list) return error.NotIterable;
-    const items = value.list;
-    if (items.len == 0) return renderNodes(loop.empty, w, scope);
-
-    for (items, 0..) |item, i| {
-        var meta = [_]Value.Entry{
-            .{ .key = "index", .value = .{ .int = @intCast(i + 1) } },
-            .{ .key = "index0", .value = .{ .int = @intCast(i) } },
-            .{ .key = "first", .value = .{ .bool = i == 0 } },
-            .{ .key = "last", .value = .{ .bool = i == items.len - 1 } },
-            .{ .key = "length", .value = .{ .int = @intCast(items.len) } },
+    fn renderNodes(self: Renderer, nodes: []const ast.Node, scope: *const Scope) RenderError!void {
+        for (nodes) |node| switch (node) {
+            .text => |text| try self.w.writeAll(text),
+            .output => |operand| try self.renderOutput(scope, operand),
+            .branch => |branch| try self.renderBranch(scope, branch),
+            .loop => |loop| try self.renderLoop(scope, loop),
         };
-        var vars = [_]Value.Entry{
-            .{ .key = loop.var_name, .value = item },
-            .{ .key = "loop", .value = .{ .map = &meta } },
-        };
-        const child: Scope = .{ .vars = &vars, .parent = scope };
-        try renderNodes(loop.body, w, &child);
     }
-}
 
-fn evalCondition(scope: *const Scope, cond: ast.Condition) RenderError!bool {
-    const result = switch (cond.kind) {
-        .truthy => |operand| (try operandValue(scope, operand)).truthy(),
-        .compare => |c| blk: {
-            const equal = Value.eql(try operandValue(scope, c.lhs), try operandValue(scope, c.rhs));
-            break :blk switch (c.op) {
-                .eq => equal,
-                .ne => !equal,
+    fn renderOutput(self: Renderer, scope: *const Scope, operand: ast.Operand) RenderError!void {
+        const path = switch (operand) {
+            .string => |literal| return self.w.writeAll(literal),
+            .path => |path| path,
+        };
+
+        const value = try self.resolvePath(scope, path);
+        const method = path.method orelse return self.writeValue(value, path);
+        if (value != .string) return self.fail(path, error.MethodOnNonString);
+
+        switch (method) {
+            .upper => for (value.string) |c| try self.w.writeByte(std.ascii.toUpper(c)),
+            .lower => for (value.string) |c| try self.w.writeByte(std.ascii.toLower(c)),
+            .indent => |width| try indent(self.w, value.string, width, false),
+        }
+    }
+
+    fn renderBranch(self: Renderer, scope: *const Scope, branch: ast.Node.Branch) RenderError!void {
+        for (branch.arms) |arm| {
+            if (try self.evalCondition(scope, arm.cond)) return self.renderNodes(arm.body, scope);
+        }
+        try self.renderNodes(branch.otherwise, scope);
+    }
+
+    fn renderLoop(self: Renderer, scope: *const Scope, loop: ast.Node.Loop) RenderError!void {
+        const value = try self.resolvePath(scope, loop.iterable);
+        if (value != .list) return self.fail(loop.iterable, error.NotIterable);
+
+        const items = value.list;
+        if (items.len == 0) return self.renderNodes(loop.empty, scope);
+
+        for (items, 0..) |item, i| {
+            var meta = [_]Value.Entry{
+                .{ .key = "index", .value = .{ .int = @intCast(i + 1) } },
+                .{ .key = "index0", .value = .{ .int = @intCast(i) } },
+                .{ .key = "first", .value = .{ .bool = i == 0 } },
+                .{ .key = "last", .value = .{ .bool = i == items.len - 1 } },
+                .{ .key = "length", .value = .{ .int = @intCast(items.len) } },
             };
-        },
-    };
-    return result != cond.negate;
-}
-
-fn operandValue(scope: *const Scope, operand: ast.Operand) RenderError!Value {
-    return switch (operand) {
-        .string => |literal| .{ .string = literal },
-        .path => |path| resolvePath(scope, path),
-    };
-}
-
-fn resolvePath(scope: *const Scope, path: ast.Path) RenderError!Value {
-    var value = scope.resolve(path.segments[0]) orelse return error.UnknownVariable;
-    for (path.segments[1..]) |segment| {
-        if (value != .map) return error.NotAMap;
-        value = Value.get(value.map, segment) orelse return error.UnknownVariable;
+            var vars = [_]Value.Entry{
+                .{ .key = loop.var_name, .value = item },
+                .{ .key = "loop", .value = .{ .map = &meta } },
+            };
+            const child: Scope = .{ .vars = &vars, .parent = scope };
+            try self.renderNodes(loop.body, &child);
+        }
     }
-    return value;
-}
 
-fn writeValue(w: *std.Io.Writer, value: Value) RenderError!void {
-    switch (value) {
-        .null => {},
-        .bool => |b| try w.writeAll(if (b) "true" else "false"),
-        .int => |n| try w.print("{d}", .{n}),
-        .float => |f| try w.print("{d}", .{f}),
-        .string => |s| try w.writeAll(s),
-        .list, .map => return error.NotPrintable,
+    /// `and` and `or` evaluate their right side only when the left side does not
+    /// decide the result, so an unresolvable name there is never looked up.
+    fn evalCondition(self: Renderer, scope: *const Scope, cond: ast.Condition) RenderError!bool {
+        switch (cond) {
+            .truthy => |operand| return (try self.operandValue(scope, operand)).truthy(),
+            .compare => |c| {
+                const lhs = try self.operandValue(scope, c.lhs);
+                const rhs = try self.operandValue(scope, c.rhs);
+                return Value.eql(lhs, rhs) == (c.op == .eq);
+            },
+            .not => |inner| return !try self.evalCondition(scope, inner.*),
+            .both => |pair| {
+                if (!try self.evalCondition(scope, pair[0].*)) return false;
+                return self.evalCondition(scope, pair[1].*);
+            },
+            .either => |pair| {
+                if (try self.evalCondition(scope, pair[0].*)) return true;
+                return self.evalCondition(scope, pair[1].*);
+            },
+        }
     }
-}
+
+    fn operandValue(self: Renderer, scope: *const Scope, operand: ast.Operand) RenderError!Value {
+        return switch (operand) {
+            .string => |literal| .{ .string = literal },
+            .path => |path| self.resolvePath(scope, path),
+        };
+    }
+
+    fn resolvePath(self: Renderer, scope: *const Scope, path: ast.Path) RenderError!Value {
+        const first = path.segments[0];
+        var value = scope.resolve(first) orelse {
+            return self.report.fail(path.offset, first, error.UnknownVariable);
+        };
+
+        for (path.segments[1..]) |segment| {
+            if (value != .map) return self.report.fail(path.offset, segment, error.NotAMap);
+            value = Value.get(value.map, segment) orelse {
+                return self.report.fail(path.offset, segment, error.UnknownVariable);
+            };
+        }
+        return value;
+    }
+
+    fn writeValue(self: Renderer, value: Value, path: ast.Path) RenderError!void {
+        switch (value) {
+            .null => {},
+            .bool => |b| try self.w.writeAll(if (b) "true" else "false"),
+            .int => |n| try self.w.print("{d}", .{n}),
+            .float => |f| try self.w.print("{d}", .{f}),
+            .string => |s| try self.w.writeAll(s),
+            .list, .map => return self.fail(path, error.NotPrintable),
+        }
+    }
+
+    /// Fails with `err`, naming the last segment of `path` as the subject.
+    fn fail(self: Renderer, path: ast.Path, err: anytype) @TypeOf(err) {
+        return self.report.fail(path.offset, path.segments[path.segments.len - 1], err);
+    }
+};

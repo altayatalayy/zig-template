@@ -8,42 +8,87 @@
 //!   {# comment #}            ignored
 //!
 //! Conditions test truthiness, equality (`a == b`, `a != b`) against another
-//! path or a quoted string literal, and may be negated with `not`. Inside a
-//! loop, `loop.index` (1-based), `loop.index0`, `loop.first`, `loop.last` and
+//! path or a quoted string literal, and combine with `not`, `and`, `or` and
+//! parentheses. Precedence, highest first: comparison, `not`, `and`, `or`.
+//! `and` and `or` short-circuit: the right side is not evaluated (and its names
+//! are not resolved) when the left side decides the result. Inside a loop,
+//! `loop.index` (1-based), `loop.index0`, `loop.first`, `loop.last` and
 //! `loop.length` are available.
 //!
-//! Whitespace follows Jinja with `trim_blocks` and `lstrip_blocks` enabled:
-//! the newline right after a `{% %}`/`{# #}` tag is removed, and leading inline
-//! whitespace on a line up to such a tag is stripped. Expression (`{{ }}`) tags
-//! are left untouched. Output is never escaped; it is written verbatim.
+//! `{{ text.indent(4) }}` indents every line of a string after the first by
+//! four spaces; see `indent` for the exact rules.
+//!
+//! Whitespace is controlled by `Options` and per-tag modifiers, see `scanner`.
+//! By default the newline right after a `{% %}`/`{# #}` tag is removed, and
+//! leading inline whitespace on a line up to such a tag is stripped. Output is
+//! never escaped; it is written verbatim.
 //!
 //! Names resolve through the enclosing scopes (innermost first), so a loop body
 //! sees both its loop variable and outer variables. A name that does not
 //! resolve fails with `error.UnknownVariable`; values are never invented.
 //!
+//! Failures are plain error unions. Pass a `Diagnostic` to learn the file,
+//! line, column and offending tag or name.
+//!
 //! The pipeline is split across modules: `scanner` (text → tokens), `parser`
 //! (tokens → `ast`), and `renderer` (`ast` + `value` → output). A parsed
-//! `Template` owns its AST in an arena but borrows the source text; keep the
-//! source alive for as long as the template is used.
+//! `Template` owns its AST in an arena but borrows the source text and the
+//! filename; keep both alive for as long as the template is used.
 
 const std = @import("std");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
 const renderer = @import("renderer.zig");
+const scanner = @import("scanner.zig");
+const Report = @import("diagnostic.zig").Report;
 
 pub const Value = @import("value.zig").Value;
+pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
+pub const ConvertError = @import("convert.zig").ConvertError;
+pub const fromZig = @import("convert.zig").fromZig;
+pub const indent = @import("indent.zig").indent;
 pub const ParseError = parser.ParseError;
 pub const RenderError = renderer.RenderError;
+
+pub const Options = struct {
+    /// Remove the newline after a block or comment tag.
+    trim_blocks: bool = true,
+
+    /// Remove indentation before a block or comment tag that starts a line.
+    lstrip_blocks: bool = true,
+
+    /// Reported in diagnostics.
+    filename: []const u8 = "<template>",
+};
 
 pub const Template = struct {
     arena: std.heap.ArenaAllocator,
     nodes: []const ast.Node,
+    source: []const u8,
+    filename: []const u8,
 
-    pub fn parse(gpa: std.mem.Allocator, source: []const u8) ParseError!Template {
-        var arena = std.heap.ArenaAllocator.init(gpa);
+    /// Parses `source`. On failure, `diag` (if given) describes the location.
+    pub fn parse(
+        alloc: std.mem.Allocator,
+        source: []const u8,
+        options: Options,
+        diag: ?*Diagnostic,
+    ) ParseError!Template {
+        var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
-        const nodes = try parser.Parser.parse(arena.allocator(), source);
-        return .{ .arena = arena, .nodes = nodes };
+
+        const report: Report = .{ .source = source, .filename = options.filename, .diag = diag };
+        const nodes = try parser.Parser.parse(arena.allocator(), report, .{
+            .trim_blocks = options.trim_blocks,
+            .lstrip_blocks = options.lstrip_blocks,
+        });
+
+        return .{
+            .arena = arena,
+            .nodes = nodes,
+            .source = source,
+            .filename = options.filename,
+        };
     }
 
     pub fn deinit(self: *Template) void {
@@ -51,42 +96,60 @@ pub const Template = struct {
         self.* = undefined;
     }
 
-    pub fn render(self: Template, w: *std.Io.Writer, ctx: Value) RenderError!void {
-        return renderer.render(self.nodes, w, ctx);
+    /// Renders into `w`. On failure, `diag` (if given) describes the location.
+    pub fn render(
+        self: Template,
+        w: *std.Io.Writer,
+        ctx: Value,
+        diag: ?*Diagnostic,
+    ) RenderError!void {
+        const report: Report = .{ .source = self.source, .filename = self.filename, .diag = diag };
+        return renderer.render(self.nodes, w, ctx, report);
     }
 };
 
 /// One-shot convenience: parse `source`, render it into `w`, free the parse.
 pub fn render(
-    gpa: std.mem.Allocator,
+    alloc: std.mem.Allocator,
     w: *std.Io.Writer,
     source: []const u8,
     ctx: Value,
+    options: Options,
+    diag: ?*Diagnostic,
 ) (ParseError || RenderError)!void {
-    var template = try Template.parse(gpa, source);
+    var template = try Template.parse(alloc, source, options, diag);
     defer template.deinit();
-    try template.render(w, ctx);
+    try template.render(w, ctx, diag);
 }
 
 // --- tests ---
 
 const testing = std.testing;
 
-fn expectRender(expected: []const u8, source: []const u8, ctx: Value) !void {
+pub fn expectRenderWith(
+    expected: []const u8,
+    source: []const u8,
+    options: Options,
+    ctx: Value,
+) !void {
     var aw = std.Io.Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
-    try render(testing.allocator, &aw.writer, source, ctx);
+    try render(testing.allocator, &aw.writer, source, ctx, options, null);
     try testing.expectEqualStrings(expected, aw.writer.buffered());
+}
+
+fn expectRender(expected: []const u8, source: []const u8, ctx: Value) !void {
+    try expectRenderWith(expected, source, .{}, ctx);
 }
 
 fn expectRenderError(err: anyerror, source: []const u8, ctx: Value) !void {
     var aw = std.Io.Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
-    try testing.expectError(err, render(testing.allocator, &aw.writer, source, ctx));
+    try testing.expectError(err, render(testing.allocator, &aw.writer, source, ctx, .{}, null));
 }
 
 fn expectParseError(err: ParseError, source: []const u8) !void {
-    try testing.expectError(err, Template.parse(testing.allocator, source));
+    try testing.expectError(err, Template.parse(testing.allocator, source, .{}, null));
 }
 
 test "plain text passes through" {
@@ -348,13 +411,15 @@ test "null renders as nothing" {
 }
 
 test "template parses once and renders repeatedly" {
-    var template = try Template.parse(testing.allocator, "hi {{ name }}");
+    var template = try Template.parse(testing.allocator, "hi {{ name }}", .{}, null);
     defer template.deinit();
 
     var aw = std.Io.Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
-    try template.render(&aw.writer, .{ .map = &.{.{ .key = "name", .value = .{ .string = "one" } }} });
-    try template.render(&aw.writer, .{ .map = &.{.{ .key = "name", .value = .{ .string = "two" } }} });
+    const one: Value = .{ .map = &.{.{ .key = "name", .value = .{ .string = "one" } }} };
+    const two: Value = .{ .map = &.{.{ .key = "name", .value = .{ .string = "two" } }} };
+    try template.render(&aw.writer, one, null);
+    try template.render(&aw.writer, two, null);
     try testing.expectEqualStrings("hi onehi two", aw.writer.buffered());
 }
 
@@ -389,7 +454,10 @@ test "parse errors are explicit" {
 test {
     // Pull in the focused unit tests living next to each stage.
     _ = @import("scanner.zig");
-    _ = @import("parser.zig");
-    _ = @import("renderer.zig");
+    _ = @import("diagnostic.zig");
+    _ = @import("indent.zig");
+    _ = @import("convert.zig");
     _ = @import("value.zig");
+    _ = @import("tests.zig");
+    _ = @import("codegen_tests.zig");
 }
